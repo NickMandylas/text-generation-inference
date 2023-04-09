@@ -13,6 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{http, Json, Router};
 use axum_tracing_opentelemetry::opentelemetry_tracing_layer;
+use futures::stream::StreamExt;
 use futures::Stream;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::convert::Infallible;
@@ -21,7 +22,6 @@ use text_generation_client::ShardedClient;
 use tokenizers::Tokenizer;
 use tokio::signal;
 use tokio::time::Instant;
-use tokio_stream::StreamExt;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{info_span, instrument, Instrument};
 use utoipa::OpenApi;
@@ -455,7 +455,7 @@ pub async fn run(
     max_batch_size: usize,
     max_waiting_tokens: usize,
     client: ShardedClient,
-    tokenizer: Tokenizer,
+    tokenizer: Option<Tokenizer>,
     validation_workers: usize,
     addr: SocketAddr,
     allow_origin: Option<AllowOrigin>,

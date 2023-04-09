@@ -25,8 +25,6 @@ from torch.nn import functional as F
 
 from torch import nn
 from transformers.activations import ACT2FN
-from transformers.modeling_utils import PreTrainedModel
-from transformers.models.gpt_neox import GPTNeoXConfig
 
 # Flash attention imports
 import rotary_emb
@@ -36,40 +34,54 @@ import dropout_layer_norm
 from flash_attn.layers.rotary import RotaryEmbedding
 
 
-class FastLayerNorm(nn.LayerNorm):
+class LlamaRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        """
+        LlamaRMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
     def forward(self, hidden_states, residual=None):
         if hidden_states.shape[-1] > 8192:
             if residual is not None:
                 hidden_states += residual
             residual = hidden_states
 
-            return super(FastLayerNorm, self).forward(hidden_states), residual
+            variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
+            hidden_states = hidden_states * torch.rsqrt(
+                variance + self.variance_epsilon
+            )
+
+            # convert into half-precision if necessary
+            if self.weight.dtype in [torch.float16, torch.bfloat16]:
+                hidden_states = hidden_states.to(self.weight.dtype)
+
+            return self.weight * hidden_states, residual
         else:
-            (
-                normed_hidden_states,
-                residual,
-                *rest,
-            ) = dropout_layer_norm.dropout_add_ln_fwd(
+            # faster post attention rms norm
+            normed_hidden_states, res, *rest = dropout_layer_norm.dropout_add_ln_fwd(
                 hidden_states,
                 residual,
                 self.weight,
-                self.bias,
+                None,
                 None,
                 None,
                 None,
                 None,
                 0.0,
-                self.eps,
+                self.variance_epsilon,
                 1.0,
                 0,
                 None,
                 False,
-                False,
+                True,  # Activate RMSNorm
             )
-            if residual is None:
-                residual = hidden_states
+            if res is None:
+                res = hidden_states
 
-            return normed_hidden_states, residual
+            return normed_hidden_states, res
 
 
 class FastLinear(nn.Linear):
@@ -250,53 +262,38 @@ class PositionRotaryEmbedding(RotaryEmbedding):
         return qkv
 
 
-class FlashNeoxAttention(torch.nn.Module):
+class FlashLlamaAttention(torch.nn.Module):
     def __init__(
         self,
         num_heads,
         hidden_size,
-        rotary_pct,
-        rotary_emb_base,
         process_group=None,
-        reduce=True,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.hidden_size = hidden_size
         self.head_size = hidden_size // num_heads
 
-        rotary_ndims = int(self.head_size * rotary_pct)
-        self.rotary_emb = PositionRotaryEmbedding(rotary_ndims, base=rotary_emb_base)
+        self.rotary_emb = PositionRotaryEmbedding(self.head_size, base=10000)
         self.softmax_scale = self.head_size ** (-0.5)
 
         if process_group is None:
-            self.query_key_value = FastLinear(hidden_size, 3 * hidden_size)
-            self.dense = FastLinear(hidden_size, hidden_size)
+            self.query_key_value = FastLinear(hidden_size, 3 * hidden_size, bias=False)
+            self.o_proj = FastLinear(hidden_size, hidden_size, bias=False)
         else:
             self.num_heads = self.num_heads // process_group.size()
             self.query_key_value = TensorParallelColumnLinear(
                 hidden_size,
                 3 * hidden_size,
+                bias=False,
                 process_group=process_group,
             )
-            self.dense = TensorParallelRowLinear(
-                hidden_size, hidden_size, process_group=process_group, reduce=reduce
+            self.o_proj = TensorParallelRowLinear(
+                hidden_size,
+                hidden_size,
+                bias=False,
+                process_group=process_group,
             )
-
-    def shuffle_qkv_dims(self):
-        """Swap dims to avoid an additional permute"""
-        self.query_key_value.weight = torch.nn.Parameter(
-            self.query_key_value.weight.view(
-                self.num_heads, 3, self.head_size, self.hidden_size
-            )
-            .permute(1, 0, 2, 3)
-            .reshape(-1, self.hidden_size)
-        )
-        self.query_key_value.bias = torch.nn.Parameter(
-            self.query_key_value.bias.view(self.num_heads, 3, self.head_size)
-            .permute(1, 0, 2)
-            .reshape(-1)
-        )
 
     def forward(
         self,
@@ -365,77 +362,72 @@ class FlashNeoxAttention(torch.nn.Module):
                 None,
             )
 
-        return self.dense(attn_output.view(-1, self.num_heads * self.head_size))
+        return self.o_proj(attn_output.view(-1, self.num_heads * self.head_size))
 
 
-class FlashMLP(nn.Module):
-    def __init__(
-        self, act, hidden_size, intermediate_size, process_group=None, reduce=True
-    ):
+class LlamaMLP(nn.Module):
+    def __init__(self, act, hidden_size, intermediate_size, process_group=None):
         super().__init__()
         self.act = (
             ACT2FN[act]
             if "gelu" not in act
-            else lambda x: torch.nn.functional.gelu(x, approximate="tanh")
+            else lambda x: torch.nn.functional.gelu(
+                x,
+                approximate="tanh"
+                if act in ["gelu_fast", "gelu_pytorch_tanh"]
+                else None,
+            )
         )
 
         if process_group is None:
-            self.dense_h_to_4h = FastLinear(hidden_size, intermediate_size)
-            self.dense_4h_to_h = FastLinear(intermediate_size, hidden_size)
+            # Fuse gate and up proj
+            self.gate_up_proj = FastLinear(
+                hidden_size, 2 * intermediate_size, bias=False
+            )
+            self.down_proj = FastLinear(intermediate_size, hidden_size, bias=False)
+            self.intermediate_size = intermediate_size
         else:
-            self.dense_h_to_4h = TensorParallelColumnLinear(
+            # Fuse gate and up proj
+            self.gate_up_proj = TensorParallelColumnLinear(
                 hidden_size,
-                intermediate_size,
+                2 * intermediate_size,
+                bias=False,
                 process_group=process_group,
             )
-            self.dense_4h_to_h = TensorParallelRowLinear(
+            self.down_proj = TensorParallelRowLinear(
                 intermediate_size,
                 hidden_size,
+                bias=False,
                 process_group=process_group,
-                reduce=reduce,
+                reduce=True,
             )
+            self.intermediate_size = self.down_proj.in_features
+
         self.process_group = process_group
 
     def forward(self, hidden_states):
-        hidden_states = self.dense_h_to_4h(hidden_states)
-        hidden_states = self.act(hidden_states)
-        hidden_states = self.dense_4h_to_h(hidden_states)
-        return hidden_states
+        gate_up_states = self.gate_up_proj(hidden_states)
+        gate_up_states = gate_up_states.view(-1, 2, self.intermediate_size)
+        return self.down_proj(self.act(gate_up_states[:, 0]) * gate_up_states[:, 1])
 
 
-class FlashNeoXLayer(nn.Module):
+class FlashLlamaLayer(nn.Module):
     def __init__(
         self,
         num_heads,
         act,
         hidden_size,
         intermediate_size,
-        rotary_pct,
-        rotary_emb_base,
-        layer_norm_eps,
-        use_parallel_residual,
+        rms_norm_eps,
         process_group=None,
     ):
         super().__init__()
-        self.use_parallel_residual = use_parallel_residual
-        self.input_layernorm = FastLayerNorm(hidden_size, eps=layer_norm_eps)
-        self.post_attention_layernorm = FastLayerNorm(hidden_size, eps=layer_norm_eps)
-        self.attention = FlashNeoxAttention(
-            num_heads,
-            hidden_size,
-            rotary_pct,
-            rotary_emb_base,
-            process_group,
-            reduce=not use_parallel_residual,
-        )
-        self.mlp = FlashMLP(
-            act,
-            hidden_size,
-            intermediate_size,
-            process_group,
-            reduce=not use_parallel_residual,
-        )
-        self.process_group = process_group
+
+        self.self_attn = FlashLlamaAttention(num_heads, hidden_size, process_group)
+        self.mlp = LlamaMLP(act, hidden_size, intermediate_size, process_group)
+
+        self.input_layernorm = LlamaRMSNorm(hidden_size, eps=rms_norm_eps)
+        self.post_attention_layernorm = LlamaRMSNorm(hidden_size, eps=rms_norm_eps)
 
     def forward(
         self,
@@ -449,63 +441,33 @@ class FlashNeoXLayer(nn.Module):
         layer_past_present_indices,
         cu_seqlens_q,
     ):
-        if self.use_parallel_residual:
-            ln1_hidden_states, _ = self.input_layernorm(hidden_states)
+        normed_hidden_states, res = self.input_layernorm(hidden_states, residual)
 
-            attn_output = self.attention(
-                ln1_hidden_states,
-                cos,
-                sin,
-                cu_seqlens,
-                max_s,
-                layer_past,
-                layer_past_present_indices,
-                cu_seqlens_q,
-            )
+        # Self Attention
+        attn_output = self.self_attn(
+            normed_hidden_states,
+            cos,
+            sin,
+            cu_seqlens,
+            max_s,
+            layer_past,
+            layer_past_present_indices,
+            cu_seqlens_q,
+        )
 
-            ln2_hidden_states, _ = self.post_attention_layernorm(hidden_states)
+        # faster post attention rms norm
+        normed_attn_res_output, attn_res = self.post_attention_layernorm(
+            attn_output, res
+        )
 
-            mlp_output = self.mlp(ln2_hidden_states)
-            intermediate = mlp_output + attn_output
+        mlp_output = self.mlp(normed_attn_res_output)
 
-            # Only reduce once and after the addition instead of once per layer
-            if self.process_group is not None:
-                torch.distributed.all_reduce(intermediate, group=self.process_group)
-
-            return intermediate + hidden_states, None
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
-            hidden_states = self.attention(
-                hidden_states,
-                cos,
-                sin,
-                cu_seqlens,
-                max_s,
-                layer_past,
-                layer_past_present_indices,
-                cu_seqlens_q,
-            )
-
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
-            )
-
-            mlp_output = self.mlp(hidden_states)
-
-            return mlp_output, residual
+        return mlp_output, attn_res
 
 
-class FlashGPTNeoXPreTrainedModel(PreTrainedModel):
-    config_class = GPTNeoXConfig
-    base_model_prefix = "gpt_neox"
-    supports_gradient_checkpointing = False
-    _no_split_modules = None
-
-
-class FlashGPTNeoXModel(FlashGPTNeoXPreTrainedModel):
+class FlashLlamaModel(torch.nn.Module):
     def __init__(self, config, process_group=None):
-        super().__init__(config)
+        super(FlashLlamaModel, self).__init__()
         self.config = config
 
         self.tp_embeddings = False
@@ -516,55 +478,41 @@ class FlashGPTNeoXModel(FlashGPTNeoXPreTrainedModel):
                 self.tp_embeddings = True
 
         if self.tp_embeddings:
-            self.embed_in = TensorParallelEmbedding(
+            self.embed_tokens = TensorParallelEmbedding(
                 config.vocab_size, config.hidden_size, process_group=process_group
             )
         else:
-            self.embed_in = nn.Embedding(config.vocab_size, config.hidden_size)
+            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
 
         self.layers = nn.ModuleList(
             [
-                FlashNeoXLayer(
+                FlashLlamaLayer(
                     config.num_attention_heads,
                     config.hidden_act,
                     config.hidden_size,
                     config.intermediate_size,
-                    config.rotary_pct,
-                    config.rotary_emb_base,
-                    config.layer_norm_eps,
-                    config.use_parallel_residual,
+                    config.rms_norm_eps,
                     process_group,
                 )
                 for _ in range(config.num_hidden_layers)
             ]
         )
-        self.final_layer_norm = FastLayerNorm(
-            config.hidden_size, eps=config.layer_norm_eps
-        )
+        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
 
-        self.head_size = self.layers[0].attention.head_size
-        self.num_heads = self.layers[0].attention.num_heads
+        self.head_size = self.layers[0].self_attn.head_size
+        self.num_heads = self.layers[0].self_attn.num_heads
 
     def post_load_weights(self):
-        if isinstance(self.embed_in, TensorParallelEmbedding):
-            self.embed_in.add_null_idx()
+        if isinstance(self.embed_tokens, TensorParallelEmbedding):
+            self.embed_tokens.add_null_idx()
         for layer in self.layers:
-            layer: FlashNeoXLayer
-            layer.attention.shuffle_qkv_dims()
-            layer.attention.query_key_value.transpose_weight()
-            layer.attention.dense.transpose_weight()
-            layer.mlp.dense_h_to_4h.transpose_weight()
-            layer.mlp.dense_4h_to_h.transpose_weight()
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        model = super(FlashGPTNeoXModel, cls).from_pretrained(
-            pretrained_model_name_or_path, *model_args, **kwargs
-        )
-        model.post_load_weights()
-        return model
+            layer: FlashLlamaLayer
+            layer.self_attn.query_key_value.transpose_weight()
+            layer.self_attn.o_proj.transpose_weight()
+            layer.mlp.gate_up_proj.transpose_weight()
+            layer.mlp.down_proj.transpose_weight()
 
     def forward(
         self,
@@ -574,7 +522,7 @@ class FlashGPTNeoXModel(FlashGPTNeoXPreTrainedModel):
         max_s,
         past_key_values=None,
     ):
-        hidden_states = self.embed_in(input_ids)
+        hidden_states = self.embed_tokens(input_ids)
 
         # Prefill
         if past_key_values is None:
@@ -600,7 +548,7 @@ class FlashGPTNeoXModel(FlashGPTNeoXPreTrainedModel):
 
         # Get rotary cos and sin for this forward
         # Avoid to index in each layer
-        cos, sin = self.layers[0].attention.rotary_emb.get_cos_sin(
+        cos, sin = self.layers[0].self_attn.rotary_emb.get_cos_sin(
             position_ids, max_s, hidden_states.dtype
         )
 
@@ -618,14 +566,14 @@ class FlashGPTNeoXModel(FlashGPTNeoXPreTrainedModel):
                 cu_seqlens_q,
             )
 
-        hidden_states, _ = self.final_layer_norm(hidden_states, residual)
+        hidden_states, _ = self.norm(hidden_states, residual)
 
         return hidden_states, past_key_values
 
 
-class FlashGPTNeoXForCausalLM(FlashGPTNeoXPreTrainedModel):
+class FlashLlamaForCausalLM(torch.nn.Module):
     def __init__(self, config, process_group=None):
-        super().__init__(config)
+        super().__init__()
 
         self.process_group = process_group
         if self.process_group is not None:
@@ -635,30 +583,20 @@ class FlashGPTNeoXForCausalLM(FlashGPTNeoXPreTrainedModel):
             self.world_size = 1
             self.rank = 0
 
-        self.gpt_neox = FlashGPTNeoXModel(config, process_group)
+        self.model = FlashLlamaModel(config, process_group)
 
-        if self.gpt_neox.tp_embeddings:
-            self.embed_out = FastLinear(
+        if self.model.tp_embeddings:
+            self.lm_head = FastLinear(
                 config.hidden_size,
                 config.vocab_size // process_group.size(),
                 bias=False,
             )
         else:
-            self.embed_out = FastLinear(
-                config.hidden_size, config.vocab_size, bias=False
-            )
+            self.lm_head = FastLinear(config.hidden_size, config.vocab_size, bias=False)
 
     def post_load_weights(self):
-        self.gpt_neox.post_load_weights()
-        self.embed_out.transpose_weight()
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        model = super(FlashGPTNeoXForCausalLM, cls).from_pretrained(
-            pretrained_model_name_or_path, *model_args, **kwargs
-        )
-        model.post_load_weights()
-        return model
+        self.model.post_load_weights()
+        self.lm_head.transpose_weight()
 
     def forward(
         self,
@@ -668,12 +606,12 @@ class FlashGPTNeoXForCausalLM(FlashGPTNeoXPreTrainedModel):
         max_s,
         past_key_values=None,
     ):
-        hidden_states, present = self.gpt_neox(
+        hidden_states, present = self.model(
             input_ids, position_ids, cu_seqlens, max_s, past_key_values
         )
-        logits = self.embed_out(hidden_states)
+        logits = self.lm_head(hidden_states)
 
-        if self.gpt_neox.tp_embeddings:
+        if self.model.tp_embeddings:
             # Logits are sharded, so we need to gather them
             world_logits = [torch.empty_like(logits) for _ in range(self.world_size)]
             torch.distributed.all_gather(world_logits, logits, group=self.process_group)
